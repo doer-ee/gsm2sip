@@ -49,6 +49,8 @@ class SipCall(
     var remoteRtpPort: Int = 0
     var remoteRtpAddress: String? = null
     var negotiatedPayloadType: Int = 9 // default G.722, updated from SDP
+    var telephoneEventPayloadType: Int? = null
+    private val handledDtmfInfo = LinkedHashSet<String>()
 
     // ── SRTP (RFC 3711 / RFC 4568) ──────────────────────
     // Two independent keys, one per direction: ours protects what we send,
@@ -104,6 +106,7 @@ class SipCall(
         fun onCallAnswered(call: SipCall)
         fun onCallTerminated(call: SipCall)
         fun onRtpReady(call: SipCall, remoteRtpAddr: String, remoteRtpPort: Int, payloadType: Int)
+        fun onDtmf(call: SipCall, digit: Char, durationMs: Int) {}
     }
 
     /** Process incoming SIP message for this dialog */
@@ -121,6 +124,7 @@ class SipCall(
                 msg.sdpRtpPort?.let { remoteRtpPort = it }
                 msg.sdpAddress?.let { remoteRtpAddress = it }
                 negotiatedPayloadType = msg.sdpPreferredPayloadType
+                telephoneEventPayloadType = msg.sdpTelephoneEventPayloadType
 
                 // We offered SRTP; this is where we find out whether they took
                 // it.  If they did not, our key is dropped so the media path
@@ -190,6 +194,34 @@ class SipCall(
                     authHandled = true
                     Log.i(TAG, "INVITE auth challenge, re-sending with credentials")
                     sipClient.resendInviteWithAuth(this, authParams)
+                }
+                return true
+            }
+
+            // Legacy SIP INFO keypad signalling, translated to cellular DTMF.
+            msg.isRequest && msg.method == "INFO" -> {
+                val contentType = msg.header("content-type")?.substringBefore(';')?.trim()
+                val digit = Regex("^Signal\\s*=\\s*([0-9*#])\\s*$", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
+                    .find(msg.body)?.groupValues?.get(1)?.single()
+                val duration = Regex("^Duration\\s*=\\s*(\\d+)\\s*$", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
+                    .find(msg.body)?.groupValues?.get(1)?.toIntOrNull() ?: 160
+                val code = when {
+                    state != State.ANSWERED -> 481
+                    !contentType.equals("application/dtmf-relay", ignoreCase = true) -> 415
+                    digit == null || msg.cseq == null -> 400
+                    else -> 200
+                }
+                val reason = when (code) {
+                    481 -> "Call/Transaction Does Not Exist"
+                    415 -> "Unsupported Media Type"
+                    400 -> "Bad Request"
+                    else -> "OK"
+                }
+                sipClient.sendResponse(SipBuilder.statusResponse(msg, code, reason, toTag = localTag),
+                    remoteContactAddress ?: sipClient.serverAddress)
+                if (code == 200 && digit != null && handledDtmfInfo.add(msg.cseq!!)) {
+                    if (handledDtmfInfo.size > 64) handledDtmfInfo.remove(handledDtmfInfo.first())
+                    listener?.onDtmf(this, digit, duration.coerceIn(100, 3000))
                 }
                 return true
             }

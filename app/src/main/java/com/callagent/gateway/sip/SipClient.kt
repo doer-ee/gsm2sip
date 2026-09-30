@@ -504,6 +504,7 @@ class SipClient(
             )
         }
         call.negotiatedPayloadType = msg.sdpPreferredPayloadType
+        call.telephoneEventPayloadType = msg.sdpTelephoneEventPayloadType
         Log.i(TAG, "Incoming INVITE codec: pt=${call.negotiatedPayloadType} codecs=${msg.sdpCodecs}")
 
         // Check for GSM-forward header

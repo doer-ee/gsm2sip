@@ -21,6 +21,9 @@ configuration copied from a live server.
   rings stops the cellular call. For a GSM-originated call whose SIP INVITE
   has not been answered, the gateway now sends `CANCEL`, not `BYE`; that last
   correction compiled and re-registered but needs a repeat live hangup test.
+- SIP keypad presses are forwarded to the active cellular call through Android
+  Telecom. The gateway accepts RTP `telephone-event` and SIP INFO
+  `application/dtmf-relay` signaling.
 
 Rapid consecutive calls can still expose a Pixel/Qualcomm audio-HAL race.
 The current profile checks whether the previous `TELEPHONY_TX` output is in

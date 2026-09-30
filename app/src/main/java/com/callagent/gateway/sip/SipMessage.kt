@@ -143,6 +143,23 @@ class SipMessage private constructor(
             return result
         }
 
+    /** RFC 4733 keypad events negotiated on the audio stream, at 8 kHz. */
+    val sdpTelephoneEventPayloadType: Int?
+        get() {
+            val audio = body.lineSequence().dropWhile { !it.startsWith("m=audio ") }
+                .toList().takeWhileIndexedAudio()
+            val offered = audio.firstOrNull()?.trim()?.split(Regex("\\s+"))
+                ?.drop(3)?.mapNotNull { it.toIntOrNull() }.orEmpty()
+            return audio.firstNotNullOfOrNull { line ->
+                val match = Regex("a=rtpmap:(\\d+)\\s+telephone-event/8000(?:/1)?\\s*", RegexOption.IGNORE_CASE)
+                    .matchEntire(line.trim())
+                match?.groupValues?.get(1)?.toIntOrNull()?.takeIf { it in offered && it in 96..127 }
+            }
+        }
+
+    private fun List<String>.takeWhileIndexedAudio(): List<String> =
+        take(1) + drop(1).takeWhile { !it.startsWith("m=") }
+
     /** Get the preferred payload type from the remote SDP.
      *  Collects all payload types offered in the remote m=audio line,
      *  then picks OUR preferred codec: G.722 > PCMA > PCMU. */
@@ -432,7 +449,8 @@ object SipBuilder {
     ): String {
         val to = msg.to ?: ""
         val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
-        val sdp = if (localRtpPort != null) buildSdp(localIp, localRtpPort, srtp, srtpTag) else null
+        val sdp = if (localRtpPort != null) buildSdp(localIp, localRtpPort, srtp, srtpTag,
+            msg.sdpTelephoneEventPayloadType) else null
         return buildString {
             append("SIP/2.0 200 OK\r\n")
             append("Via: ${msg.via}\r\n")
@@ -603,9 +621,9 @@ object SipBuilder {
             append("User-Agent: $userAgent\r\n")
             // The real set: CANCEL and MESSAGE included because inbound ones
             // are handled; nothing here is aspirational.
-            append("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, MESSAGE\r\n")
+            append("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, MESSAGE, INFO\r\n")
             // text/plain because inbound MESSAGE carries SMS bodies.
-            append("Accept: application/sdp, text/plain\r\n")
+            append("Accept: application/sdp, text/plain, application/dtmf-relay\r\n")
             append("Accept-Encoding: identity\r\n")
             append("Content-Type: application/sdp\r\n")
             append("Content-Length: ${sdp.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
@@ -626,16 +644,18 @@ object SipBuilder {
         localIp: String,
         rtpPort: Int,
         srtp: SrtpKeys? = null,
-        srtpTag: Int = 1
+        srtpTag: Int = 1,
+        telephoneEventPayloadType: Int? = 101
     ): String = buildString {
         // G.722 is wideband (16 kHz sampling) but its SDP clock rate is
         // written as 8000 per RFC 3551 — a historical quirk, not a typo.
         // telephone-event is always offered: it carries DTMF, not voice.
-        val payloads = when (codecMode) {
-            "g711" -> "8 0 101"
-            "both" -> "9 8 0 101"
-            else -> "9 101"
+        val voicePayloads = when (codecMode) {
+            "g711" -> "8 0"
+            "both" -> "9 8 0"
+            else -> "9"
         }
+        val payloads = voicePayloads + (telephoneEventPayloadType?.let { " $it" } ?: "")
         append("v=0\r\n")
         append("o=gateway 0 0 IN IP4 $localIp\r\n")
         append("s=SIP Call\r\n")
@@ -653,8 +673,10 @@ object SipBuilder {
             append("a=rtpmap:8 PCMA/8000\r\n")
             append("a=rtpmap:0 PCMU/8000\r\n")
         }
-        append("a=rtpmap:101 telephone-event/8000\r\n")
-        append("a=fmtp:101 0-16\r\n")
+        telephoneEventPayloadType?.let {
+            append("a=rtpmap:$it telephone-event/8000\r\n")
+            append("a=fmtp:$it 0-11\r\n")
+        }
         append("a=ptime:20\r\n")
         append("a=sendrecv\r\n")
     }

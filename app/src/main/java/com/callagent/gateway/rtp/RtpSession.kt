@@ -193,6 +193,8 @@ class RtpSession(
     private val SILENCE_FRAME_LIMIT get() = profile.captureSilenceFrames
 
     var listener: Listener? = null
+    var telephoneEventPayloadType: Int? = null
+    private val telephoneEvents = TelephoneEventReceiver()
 
     interface Listener {
         fun onRtpStarted()
@@ -200,6 +202,7 @@ class RtpSession(
         fun onRtpError(error: String)
         fun onRtpTimeout() {}  // No RTP received for RTP_TIMEOUT_MS
         fun onRtpStats(stats: String) {}  // Periodic detailed stats
+        fun onDtmf(digit: Char, durationMs: Int) {}
     }
 
     fun start() {
@@ -1220,6 +1223,10 @@ class RtpSession(
                 // Log first packet details for debugging
                 if (rxPacketCount == 1L) {
                     Log.i(TAG, "First RX: pt=${rtp.payloadType} len=${rtp.payload.size}")
+                }
+                if (rtp.payloadType == telephoneEventPayloadType) {
+                    telephoneEvents.receive(rtp)?.let { listener?.onDtmf(it.digit, it.durationMs) }
+                    continue
                 }
                 if (rtp.payloadType == payloadType || rtp.payloadType == RtpPacket.PT_PCMA || rtp.payloadType == RtpPacket.PT_G722) {
                     if (!jitterBuffer.offer(rtp.payload)) {

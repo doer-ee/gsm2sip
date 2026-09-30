@@ -11,6 +11,7 @@ import android.telephony.TelephonyManager
 import android.util.Log
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.gsm.GsmCallManager
+import com.callagent.gateway.gsm.CellularDtmfSender
 import com.callagent.gateway.rtp.RtpPacket
 import com.callagent.gateway.rtp.SrtpContext
 import com.callagent.gateway.rtp.RtpSession
@@ -53,6 +54,7 @@ class CallOrchestrator(
     private var activeRtpSession: RtpSession? = null
     private var activeSipCall: SipCall? = null
     private var activeGsmCall: Call? = null
+    private val dtmfSender = CellularDtmfSender()
     /** False while the previous RTP/HAL session is still being released. */
     @Volatile private var audioReady = true
 
@@ -755,6 +757,17 @@ class CallOrchestrator(
         Log.i(TAG, "SIP call answered: ${call.callId}")
     }
 
+    override fun onDtmf(call: SipCall, digit: Char, durationMs: Int) {
+        if (activeSipCall === call) forwardDtmf(digit, durationMs)
+    }
+
+    private fun forwardDtmf(digit: Char, durationMs: Int) {
+        val call = activeGsmCall ?: GsmCallManager.activeCall ?: return
+        if (bridgeState == BridgeState.BRIDGED && call.state == Call.STATE_ACTIVE) {
+            dtmfSender.send(call, digit, durationMs)
+        }
+    }
+
     // onCallTerminated is already implemented above (shared by SipClient.Listener and SipCall.Listener)
 
     override fun onRtpReady(call: SipCall, remoteRtpAddr: String, remoteRtpPort: Int, payloadType: Int) {
@@ -907,6 +920,7 @@ class CallOrchestrator(
             }
         }
         val session = RtpSession(context, localPort, remoteAddr, remotePort, payloadType)
+        session.telephoneEventPayloadType = activeSipCall?.telephoneEventPayloadType
 
         // Attach the negotiated SRTP keys, if this call has any.  Done before
         // start() so no packet is ever sent or accepted unprotected on a call
@@ -921,6 +935,9 @@ class CallOrchestrator(
             }
         }
         session.listener = object : RtpSession.Listener {
+            override fun onDtmf(digit: Char, durationMs: Int) {
+                if (generation == gen && activeRtpSession === session) forwardDtmf(digit, durationMs)
+            }
             override fun onRtpStarted() {
                 Log.i(TAG, "RTP session started")
             }
@@ -974,6 +991,7 @@ class CallOrchestrator(
     private fun tearDown(reason: String, sipStatus: Pair<Int, String>? = null) {
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
         bridgeState = BridgeState.TEARING_DOWN
+        dtmfSender.clear()
         gsmStateWatchdog?.cancel(false)
         gsmStateWatchdog = null
         diallerInitiated = false
@@ -1136,6 +1154,7 @@ class CallOrchestrator(
      *  stale states where the normal tearDown path was never triggered. */
     @Synchronized
     private fun forceReset(reason: String) {
+        dtmfSender.clear()
         Log.w(TAG, "Force-resetting bridge: $reason")
         gsmStateWatchdog?.cancel(false)
         gsmStateWatchdog = null

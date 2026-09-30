@@ -366,6 +366,15 @@ the agent is actually on the line, with no dead air at the join.
 | `486` / `603` / any 4xx-6xx | Ends the GSM call |
 | No response | Retries, then gives up and ends the GSM call |
 
+## In-call keypad (DTMF)
+
+During an active GSM/SIP call, keypad presses from the SIP phone are accepted
+as RTP `telephone-event` packets or SIP INFO `application/dtmf-relay` messages.
+The gateway forwards each completed digit (`0`–`9`, `*`, or `#`) through
+Android Telecom to the cellular call, so automated customer-service menus can
+receive selections. Digits are queued briefly when several are pressed in
+quick succession.
+
 ## SMS over SIP
 
 Messages travel as page-mode SIP MESSAGE (RFC 3428) over the registration that
