@@ -5,7 +5,7 @@
 <h1 align="center">gsm2sip</h1>
 
 <p align="center">
-Bridges Android phone to any SIP server as GSM Gateway
+Bridges an Android phone to a SIP server as a cellular gateway
 </p>
 
 | Calls and messages | Link detail | Settings |
@@ -16,11 +16,13 @@ Bridges Android phone to any SIP server as GSM Gateway
 
 A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gateway:
 
-- **Inbound**: Someone calls the SIM's number → the phone answers → the call is bridged to the SIP server, which routes it wherever the dialplan says (an AI agent, a queue, an extension)
-- **Outbound**: the SIP server sends an INVITE with an `X-GSM-Forward: +<number>` header → the phone dials that number over GSM → audio is bridged back to SIP
+- **Inbound**: Someone calls a SIM → the gateway sends a SIP INVITE addressed to that SIM's configured number → the SIP server routes it to an agent, queue, extension, or ring group. The cellular leg is answered when the SIP leg answers.
+- **Outbound**: The SIP server sends an INVITE with `X-GSM-Forward: +<number>` → the gateway dials that number over the cellular network. On a dual-SIM phone, the INVITE's outbound caller ID must uniquely match a configured SIM number.
 - **SMS**: messages arriving on any SIM are forwarded to the server as SIP MESSAGE, and the server can ask the gateway to send one and be told what became of it — see [SMS over SIP](#sms-over-sip)
 
-Audio flows through shared speaker/mic — both GSM and SIP audio run concurrently on the same hardware, enabled by a Magisk module that disables Android's audio concurrency restrictions.
+On tested Qualcomm phones, voice uses a **digital** path: SIP audio is injected through `incall_music_uplink`/`Telephony Tx`, and cellular downlink is captured through the in-call recording path. It is not meant to pipe the handset speaker into its microphone. The Magisk module supplies the privileged app and audio permissions; device-specific vendor audio routing is still required.
+
+The [Pixel 4a + FreePBX guide](docs/pixel-4a-freepbx.md) covers the Android 13 deployment, per-SIM numbers, outbound routing, charge protection, and troubleshooting discovered during live calls.
 
 ## Audio Codec
 
@@ -42,12 +44,23 @@ remote actually offered rather than failing a call over a preference.
 | Device | SoC | Agent → caller | Caller → agent | Status |
 |---|---|---|---|---|
 | Xiaomi Poco X3 NFC (`surya`) | Qualcomm SM6150/SM7150, WCD9375 | digital, via `incall_music` → `Telephony Tx` | digital, via `VOICE_DOWNLINK` | **fully working** |
+| Google Pixel 4a (`sunfish`) | Qualcomm SM7150 family (`ro.board.platform=sm6150`) | digital, via `incall_music_uplink` → `Telephony Tx` | digital, via `VOC_REC_DL`/in-call recording | **working on Android 13; rapid-call audio timing still being characterized** |
 | Samsung Galaxy S4 Mini (`serranolte`) | Qualcomm MSM8960, WCD9304 | digital, via `incall_music` | digital, via `VOC_REC_*` | **fully working** |
 | Samsung Galaxy S10e | Exynos 9820, CS47L93 | no path | no path | not usable |
 
 **The Poco X3 NFC is the reference device and works fully**: G.722 wideband in
 both directions, entirely through the modem, with the handset's own microphone
 and speaker muted for the whole call.
+
+**The Pixel 4a has been tested on stock Android 13 with Magisk**. Its vendor
+audio policy exposes `incall_music_uplink`, `Telephony Tx`, `Telephony Rx`, and
+`voice_rx`; the mixer exposes Incall Music and `VOC_REC_DL/UL` controls. Live
+calls have worked in both directions. Rapid consecutive calls can expose a
+Qualcomm audio-output drain race, so this profile waits for the previous
+`TELEPHONY_TX` output to report standby before starting a new call, with an
+18-second maximum fallback. This is a readiness check, not an unconditional
+18-second delay. Do not assume that every call pattern or two concurrent calls
+has been validated.
 
 **The Galaxy S4 Mini works fully too**, which is worth dwelling on because it
 is a 2013 handset on LineageOS 16 (Android 9) and armeabi-v7a — and because its
@@ -79,6 +92,7 @@ What has actually been checked so far:
 | Device | SoC | Vendor | Result |
 |---|---|---|---|
 | Poco X3 NFC | SM6150/SM7150 | Xiaomi (MIUI) | fully working, verified on live calls |
+| Pixel 4a (`sunfish`) | SM7150 family / reported `sm6150` | Google Android 13 | two-way live calls verified; consecutive-call reliability needs continued testing |
 | Galaxy S4 Mini | MSM8960 | LineageOS 16 | fully working, verified on a live call |
 | Galaxy S10e | Exynos 9820 | — | no path in either direction |
 
@@ -113,12 +127,13 @@ That is why the gateway moved to a Qualcomm device.
 
 ## Requirements
 
-- **Device**: Qualcomm-based Android phone with LineageOS + Magisk root
-  (developed against a Poco X3 NFC on Android 16)
-- **SIM**: SIM card with voice plan
-- **Network**: Stable WiFi connection
-- **Power**: Always connected to charger
-- **Build host**: Linux with JDK 17+
+- **Device**: Compatible Qualcomm Android phone with Magisk root and a vendor
+  audio path that passes `tools/check-device.sh`. The Pixel 4a was tested on
+  stock Android 13; a custom ROM is not required for that device.
+- **SIM**: Active cellular voice service (and SMS service if using messaging).
+- **Network**: Wi-Fi or mobile data with reachability to the SIP server.
+- **Power**: Stable external power recommended for an always-on gateway.
+- **Build host**: JDK 17+ and Android SDK (the Gradle build was also verified on macOS).
 
 ## Download
 
@@ -156,12 +171,16 @@ Only the Magisk module needs to be installed — it includes the APK and handles
 3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → gsm2sip
 4. **Configure SIP**: open Settings in the app (the gear, top right) and enter
    your SIP server address, port, username and password
-5. **Own Number**: Enter the SIM's own number in international format, e.g.
+5. **Own Number**: Enter each active SIM's own number in its slot-specific
+   setting, in international format, e.g.
    `+4915112345678`.  This is sent as the SIP destination so the server can
    route on the number that was dialled, the same way a VoIP router sends the
-   DID.  Leaving it unset makes the gateway address its own extension,
-   which most servers route straight back to the device — the call then loops
-   and the GSM leg is never answered.
+   DID. On a dual-SIM phone, the incoming call's `PhoneAccountHandle` selects
+   the slot; this setting also identifies the SIM for outbound calls when it
+   matches the SIP Outbound CID. If a slot number is missing, inbound routing
+   tries that subscription's SIM-reported number and then the legacy Own
+   Number. If no usable number is found, the gateway may address its own
+   extension and create a call loop.
 6. **Start**: the gateway registers and begins bridging calls; the header pill
    shows **Online** once registration succeeds (tap it to retry)
 
@@ -171,6 +190,10 @@ Only the Magisk module needs to be installed — it includes the APK and handles
   MSISDN.  Not the SIP account name.
 - **From** — the calling party, passed through exactly as the carrier delivered
   it (some send `+49…`, some `0…`; the app does not rewrite it).
+- **Outbound SIM selection** — on a SIP-to-cellular INVITE, the gateway reads
+  `P-Asserted-Identity`, then `Remote-Party-ID`, then `From` for a caller ID
+  matching one configured SIM number. A missing or ambiguous match is rejected
+  rather than silently using the wrong SIM.
 
 Whatever the server routes on, it has to recognise the SIM's number: the
 gateway puts that number in the Request-URI, so a dialplan or number table
@@ -188,12 +211,18 @@ there is nothing to write on the server side:
    password, plus the SIM's own number under **Own Number**.
 3. Save. The gateway registers, and calls to the SIM reach your agent.
 
+If you also originate cellular calls through a dual-SIM gateway, make sure
+the server sends an Outbound CID that matches the desired SIM's Own Number.
+
 ## The longer way: your own Asterisk
 
 The gateway is server-agnostic — it registers like any SIP client — so you can
 point it at a server you run instead. What follows is one worked example,
 using Asterisk (chan_sip) to route inbound GSM calls to an AI agent. Adapt it
 to whatever your server does.
+
+For a tested **FreePBX/PJSIP** arrangement with dynamic destinations and
+dual-SIM selection, use the [Pixel 4a + FreePBX guide](docs/pixel-4a-freepbx.md).
 
 It addresses calls the way a VoIP router does: the Request-URI carries the
 SIM's number and `From` carries the calling party. That shapes the config
@@ -275,6 +304,10 @@ either would be a loop, and so is anything that is not a bare number. Under
 `chan_pjsip`, note that `SIPAddHeader()` is silently a no-op — the header form
 there is `Set(PJSIP_HEADER(add,X-GSM-Forward)=${EXTEN})`.
 
+For this build, the outbound INVITE must also present a caller ID matching
+one configured SIM's Own Number; the destination header alone does not select
+a SIM. See the [FreePBX/PJSIP example](docs/pixel-4a-freepbx.md#outbound-calls-pbx-to-cellular).
+
 Allow enough time in `Dial()` for GSM setup — 60s is comfortable, 20s is not.
 
 ## Call status codes
@@ -297,6 +330,7 @@ branch on `${DIALSTATUS}` and `${HANGUPCAUSE}` instead of guessing.
 | Cancelled at the handset | `487 Request Terminated` |
 | Number barred | `403 Forbidden` |
 | Gateway already on a call | `486 Busy Here` |
+| Outbound caller ID does not select exactly one configured SIM | `503 No Matching SIM` |
 | No destination in the INVITE | `488 Not Acceptable Here` |
 | Anything failing after the answer | `BYE` |
 
@@ -540,7 +574,7 @@ own number, until the allowance resets.
 ```
 ┌─────────────────┐     GSM      ┌──────────────────┐
 │  Remote Caller   │◄───────────►│  Android Phone    │
-│  (local #)       │   voice     │  (Poco X3 + SIM)  │
+│  (local #)       │   voice     │ (Poco / Pixel 4a) │
 └─────────────────┘              │                    │
                                  │  ┌──────────────┐ │
                                  │  │ InCallService │ │  GSM call control
@@ -556,7 +590,7 @@ own number, until the allowance resets.
                                  │  └──────┬───────┘ │
                                  └─────────┼─────────┘
                                            │ SIP/RTP
-                                           │ (WiFi)
+                                           │ (Wi-Fi / LTE)
                                  ┌─────────▼─────────┐
                                  │    SIP Server      │
                                  │  (Asterisk, etc.)  │
@@ -600,7 +634,20 @@ The `gateway-magisk.zip` module does two critical things:
 - **Calls loop back and never answer**: the Own Number setting is unset, so the
   gateway is INVITEing its own extension.
 - **One-way audio**: Ensure the Magisk module is installed and device is rebooted
-- **Echo**: The app uses Android's AcousticEchoCanceler + VOICE_COMMUNICATION mode
-- **SIP not registering**: Check WiFi connectivity, server address, and credentials
+- **Pixel 4a intermittent one-way audio on rapid calls**: Inspect the app log
+  and `dumpsys media.audio_flinger` for a blocked `TELEPHONY_TX` output.
+  The gateway checks for standby before reusing it, up to the profile's
+  18-second maximum. Do not assume a released Java `AudioTrack` means the
+  vendor HAL has drained.
+- **Echo**: Check whether capture is on the digital downlink or an acoustic
+  fallback. Echo cancellation is not a substitute for correct vendor routing.
+- **SIP not registering**: Check server address, credentials, firewall/NAT, and
+  the active Android network. The Pixel 4a fix uses local UDP port `5062`, an
+  IPv4 socket bound to the active `Network`, and STUN on that same network;
+  it has registered over both Wi-Fi and LTE. See the [diagnostic guide](docs/pixel-4a-freepbx.md#registration-on-wi-fi-or-lte).
+- **Outbound call reaches a busy announcement**: Confirm the FreePBX route has
+  the gateway trunk in its trunk sequence, route Outbound CID overrides the
+  extension's CID, and that CID matches exactly one configured SIM.
 - **Calls not auto-answering**: Ensure the app is set as the default phone app
-- **Audio drops**: Check WiFi stability; the app holds a WiFi lock but poor signal will cause issues
+- **Audio drops**: Check the active data network, RTP flow, and cellular voice
+  state. A Wi-Fi lock cannot compensate for poor Wi-Fi signal.
