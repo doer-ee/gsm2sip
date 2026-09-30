@@ -197,10 +197,12 @@ numbers or SIP credentials.
 ## Battery charge protection
 
 The Pixel 4a-specific option in app Settings is off by default. With root,
-it reads battery capacity every 30 seconds and writes
-`/sys/class/power_supply/smb5/charge_disable`: at or above the upper
-threshold it pauses charging; at or below the lower threshold it resumes;
-inside the band it keeps the existing state. Defaults are 35%/65%; the UI
+it reads battery capacity every 30 seconds and writes the Pixel 4a's
+authoritative
+`/sys/class/power_supply/sm7150_bms/charge_disable` node (with the older
+`smb5/charge_disable` node as a fallback): at or above the upper threshold it
+pauses charging; at or below the lower threshold it resumes; inside the band
+it keeps the existing state. Defaults are 35%/65%; the UI
 enforces a gap of at least five percentage points. Turning the feature off
 releases a charge gate it owns.
 

@@ -58,6 +58,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
+import com.callagent.gateway.service.BatteryChargeGuard
 import com.callagent.gateway.sms.SmsOutbox
 import com.callagent.gateway.service.GatewayService
 import java.text.SimpleDateFormat
@@ -758,7 +759,11 @@ class MainActivity : AppCompatActivity() {
         Thread({
             val out = RootShell.execForOutput(
                 "echo CAP=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null); " +
-                    "echo DIS=$(cat /sys/class/power_supply/smb5/charge_disable 2>/dev/null); " +
+                    "if [ -e ${BatteryChargeGuard.PRIMARY_DISABLE} ]; then " +
+                    "echo DIS=$(cat ${BatteryChargeGuard.PRIMARY_DISABLE} 2>/dev/null); " +
+                    "elif [ -e ${BatteryChargeGuard.LEGACY_DISABLE} ]; then " +
+                    "echo DIS=$(cat ${BatteryChargeGuard.LEGACY_DISABLE} 2>/dev/null); " +
+                    "else echo DIS=; fi; " +
                     "echo USB=$(cat /sys/class/power_supply/usb/online 2>/dev/null)",
                 timeoutMs = 5000
             )

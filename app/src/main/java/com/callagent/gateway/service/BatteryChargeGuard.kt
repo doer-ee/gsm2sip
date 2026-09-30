@@ -25,8 +25,9 @@ class BatteryChargeGuard(private val context: Context) {
 
     fun stop() {
         worker.shutdownNow()
-        if (prefs.getBoolean(KEY_OWNED, false)) {
-            if (setDisabled(false)) {
+        val disablePath = controlPath()
+        if (disablePath.isNotEmpty() && prefs.getBoolean(KEY_OWNED, false)) {
+            if (setDisabled(false, disablePath)) {
                 prefs.edit().putBoolean(KEY_OWNED, false).commit()
             }
         }
@@ -40,7 +41,12 @@ class BatteryChargeGuard(private val context: Context) {
         val owned = prefs.getBoolean(KEY_OWNED, false)
         if (!enabled && !owned) return
 
-        val current = RootShell.execForOutput("cat $DISABLE 2>/dev/null").trim().toIntOrNull()
+        val disablePath = controlPath()
+        if (disablePath.isEmpty()) {
+            Log.w(TAG, "Charging switch unavailable; no supported charge_disable node")
+            return
+        }
+        val current = RootShell.execForOutput("cat $disablePath 2>/dev/null").trim().toIntOrNull()
         if (current !in 0..1) {
             Log.w(TAG, "Charging switch unavailable; leaving it unchanged")
             return
@@ -49,7 +55,7 @@ class BatteryChargeGuard(private val context: Context) {
         if (!enabled) {
             // Release a gate that *this* feature set. Do not interfere with
             // another charge manager when this feature has never controlled it.
-            if (current == 0 || setDisabled(false)) {
+            if (current == 0 || setDisabled(false, disablePath)) {
                 prefs.edit().putBoolean(KEY_OWNED, false).commit()
             }
             return
@@ -74,23 +80,37 @@ class BatteryChargeGuard(private val context: Context) {
             else -> return // Keep the previous state inside the hysteresis band.
         }
         if (current == if (shouldDisable) 1 else 0) return
-        if (setDisabled(shouldDisable)) {
+        if (setDisabled(shouldDisable, disablePath)) {
             if (shouldDisable) prefs.edit().putBoolean(KEY_OWNED, true).commit()
             Log.i(TAG, "Charge ${if (shouldDisable) "paused" else "resumed"} at $capacity% ($start–$stop%)")
         }
     }
 
-    private fun setDisabled(disabled: Boolean): Boolean {
+    private fun setDisabled(disabled: Boolean, disablePath: String): Boolean {
         val value = if (disabled) 1 else 0
-        val ok = RootShell.exec("echo $value > $DISABLE", timeoutMs = 8000) == 0 &&
-            RootShell.execForOutput("cat $DISABLE 2>/dev/null").trim() == value.toString()
-        if (!ok) Log.e(TAG, "Could not set charge_disable=$value")
+        val ok = RootShell.exec("echo $value > $disablePath", timeoutMs = 8000) == 0 &&
+            RootShell.execForOutput("cat $disablePath 2>/dev/null").trim() == value.toString()
+        if (!ok) Log.e(TAG, "Could not set charge_disable=$value at $disablePath")
         return ok
+    }
+
+    /**
+     * Pixel 4a exposes the effective charger gate through the Google battery
+     * driver. Older/alternate Qualcomm kernels may expose only the SMB5 node,
+     * so prefer the Pixel node and retain the legacy fallback.
+     */
+    private fun controlPath(): String {
+        val result = RootShell.execForOutput(
+            "if [ -e $PRIMARY_DISABLE ]; then echo $PRIMARY_DISABLE; " +
+                "elif [ -e $LEGACY_DISABLE ]; then echo $LEGACY_DISABLE; fi"
+        ).trim()
+        return result.takeIf { it == PRIMARY_DISABLE || it == LEGACY_DISABLE }.orEmpty()
     }
 
     companion object {
         private const val TAG = "BatteryChargeGuard"
-        private const val DISABLE = "/sys/class/power_supply/smb5/charge_disable"
+        const val PRIMARY_DISABLE = "/sys/class/power_supply/sm7150_bms/charge_disable"
+        const val LEGACY_DISABLE = "/sys/class/power_supply/smb5/charge_disable"
         private const val CAPACITY = "/sys/class/power_supply/battery/capacity"
         const val KEY_ENABLED = "battery_protection"
         const val KEY_START = "battery_start_threshold"
