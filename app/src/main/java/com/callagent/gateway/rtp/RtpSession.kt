@@ -182,6 +182,7 @@ class RtpSession(
     // (when decayingPlaybackRms <= echoGateThreshold) to avoid false resets
     // from incall_music echo leaking back through VOICE_CALL capture.
     private val SILENCE_RMS_THRESHOLD = 10   // Below this = truly dead source (ADC noise floor)
+    @Volatile private var captureMixerApplied = false
 
     /** How long to let a source settle before judging its frame rate. */
     private val RATE_CHECK_AFTER_MS = 4000L
@@ -307,6 +308,21 @@ class RtpSession(
             }
         }
 
+        // Qualcomm's in-call capture usecase is selected when AudioRecord is
+        // created.  On Pixel 4a the VOC_REC_DL mixer must already be enabled
+        // at that moment; the delayed setup from GsmCallManager can otherwise
+        // run after AudioRecord has opened, leaving VOICE_DOWNLINK initialized
+        // but silent.  Do this synchronously for digital profiles; the call
+        // manager does not issue a second setup pass.
+        if (profile.voiceDownlinkWorks && profile.mixerSetupCmd.isNotEmpty()) {
+            Log.i(TAG, "Preparing digital capture mixer before AudioRecord")
+            try {
+                GsmCallManager.batchMixerSetup()
+            } catch (e: Exception) {
+                Log.w(TAG, "Pre-capture mixer setup failed: ${e.message}")
+            }
+        }
+
         // Playback rate matches codec output rate.  G.722 decodes to 16 kHz.
         playbackRate = when (payloadType) {
             RtpPacket.PT_PCMA, RtpPacket.PT_PCMU -> 8000
@@ -388,6 +404,17 @@ class RtpSession(
         // reordering only the fallback list left every call still starting on
         // VOICE_CALL@16k and discovering it was dead ~11s later.  The agent
         // heard silence for those 11 seconds of every call.
+        if (profile.preferUnprocessedMic) {
+            // Some Qualcomm profiles expose digital voice sources that
+            // initialize successfully but return only zeros.  For an
+            // explicitly acoustic profile, try the raw microphone first.
+            val rawMic = configs.filter {
+                it.source == MediaRecorder.AudioSource.UNPROCESSED ||
+                    it.source == MediaRecorder.AudioSource.CAMCORDER
+            }
+            configs.removeAll(rawMic)
+            configs.addAll(0, rawMic)
+        }
         if (profile.preferVoiceRecognition) {
             val vr = configs.filter { it.source == MediaRecorder.AudioSource.VOICE_RECOGNITION }
             configs.removeAll(vr)
@@ -458,6 +485,12 @@ class RtpSession(
                 Log.w(TAG, "AudioRecord prime failed: ${e.message}")
             }
 
+            // Opening the Pixel in-call record stream can reset the active
+            // VOC_REC front-end.  Re-apply only those capture switches now,
+            // before the playback track is created; the voice route itself is
+            // left alone while it is live.
+            applyCaptureMixerAfterStart()
+
             // Diagnostic sweep — off unless explicitly enabled, see
             // audioDiagnosticsEnabled().
             if (audioDiagnosticsEnabled()) logCaptureDiagnostics(record)
@@ -509,8 +542,8 @@ class RtpSession(
             AudioAttributes.USAGE_VOICE_COMMUNICATION -> "VOICE_COMMUNICATION"
             else -> "usage=$usage"
         }
-        // Must happen before the track exists on HALs that pick the output
-        // usecase at creation time — see DeviceProfile.incallMusicBeforeTrack.
+        // Pixel's incall_music parameter must be enabled before the playback
+        // track is created so AudioPolicy selects incall_music_uplink.
         if (profile.incallMusicBeforeTrack) {
             enableIncallMusic()
         }
@@ -735,6 +768,14 @@ class RtpSession(
             }
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
         }
+        if (profile.preferUnprocessedMic) {
+            val rawMic = configs.filter {
+                it.source == MediaRecorder.AudioSource.UNPROCESSED ||
+                    it.source == MediaRecorder.AudioSource.CAMCORDER
+            }
+            configs.removeAll(rawMic)
+            configs.addAll(0, rawMic)
+        }
         if (profile.preferVoiceRecognition) {
             // Ahead of everything, including VOICE_DOWNLINK: on these handsets
             // it is the source that actually delivers a steady frame rate, and
@@ -742,6 +783,16 @@ class RtpSession(
             val vr = configs.filter { it.source == MediaRecorder.AudioSource.VOICE_RECOGNITION }
             configs.removeAll(vr)
             configs.addAll(0, vr)
+        }
+        if (profile.voiceDownlinkWorks && profile.silenceLocalAudio) {
+            // Pixel digital mode has no usable acoustic fallback: the local
+            // speaker and microphone are intentionally muted.  Keeping MIC
+            // sources in this list only makes a failed digital track look
+            // initialized while sending room silence to SIP.
+            return configs.filter {
+                it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK &&
+                    it.source !in silentSourceIds
+            }
         }
         return configs.filterNot { it.source in silentSourceIds }
     }
@@ -945,15 +996,19 @@ class RtpSession(
             record.startRecording()
         }
 
-        // Re-assert in-call capture routing now that the stream exists — see
-        // DeviceProfile.mixerCaptureCmd.  Off the capture thread, because the
-        // su round-trip takes ~100ms and would stall the first RTP frames.
-        val capCmd = DeviceProfile.resolveCmd(profile.mixerCaptureCmd)
-        if (capCmd.isNotEmpty()) {
-            Thread({
-                val out = RootShell.execForOutput(capCmd, timeoutMs = 8000)
-                Log.i(TAG, "Mixer capture routing: $out")
-            }, "mixer-capture").start()
+        // The Pixel mixer is applied synchronously after AudioRecord starts,
+        // before AudioTrack creation.  Other profiles keep their historical
+        // asynchronous post-start setup.
+        if (profile.voiceDownlinkWorks) {
+            applyCaptureMixerAfterStart()
+        } else {
+            val capCmd = DeviceProfile.resolveCmd(profile.mixerCaptureCmd)
+            if (capCmd.isNotEmpty()) {
+                Thread({
+                    val out = RootShell.execForOutput(capCmd, timeoutMs = 8000)
+                    Log.i(TAG, "Mixer capture routing: $out")
+                }, "mixer-capture").start()
+            }
         }
 
         Log.i(TAG, "Capture routedFrom=${record.routedDevice?.type}")
@@ -1035,7 +1090,22 @@ class RtpSession(
                             Log.w(TAG, "Source $audioSourceName low audio (no-echo): rawCapRMS=$rawCaptureRms silence=${silenceFrameCount}/${SILENCE_FRAME_LIMIT} frames")
                         }
                         if (silenceFrameCount >= SILENCE_FRAME_LIMIT) {
-                            if (sourceProven) {
+                            if (profile.voiceDownlinkWorks && profile.silenceLocalAudio) {
+                                // This is the complete Pixel digital capture
+                                // path.  Do not tear it down or open a MIC
+                                // fallback during a quiet GSM interval: doing
+                                // so reprograms the Qualcomm voice route and
+                                // makes a recoverable quiet period permanent.
+                                val now = System.currentTimeMillis()
+                                if (now - lastDeadAirLog > 30_000) {
+                                    lastDeadAirLog = now
+                                    val msg = "Dead air ${silenceFrameCount / 25}s on " +
+                                        "$audioSourceName (digital source — keeping it)"
+                                    Log.w(TAG, msg)
+                                    listener?.onRtpStats(msg)
+                                }
+                                silenceFrameCount = 0
+                            } else if (sourceProven) {
                                 // Dead air, not a dead source.  Tearing the
                                 // AudioRecord down here and blacklisting the
                                 // source was catastrophic mid-call: with
@@ -1176,6 +1246,20 @@ class RtpSession(
             }
         }
         return true  // Normal exit (call ended)
+    }
+
+    /** Apply only the capture-front-end switches after a Pixel recorder opens. */
+    private fun applyCaptureMixerAfterStart() {
+        if (!profile.voiceDownlinkWorks || captureMixerApplied) return
+        val capCmd = DeviceProfile.resolveCmd(profile.mixerCaptureCmd)
+        if (capCmd.isEmpty()) return
+        try {
+            val out = RootShell.execForOutput(capCmd, timeoutMs = 8000)
+            Log.i(TAG, "Mixer capture routing: $out")
+            captureMixerApplied = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Mixer capture routing failed: ${e.message}")
+        }
     }
 
     // ── Receive: RTP recv → jitter buffer ───────────────
@@ -1740,8 +1824,9 @@ class RtpSession(
 
     /**
      * Set incall_music_enabled=true via AudioManager.
-     * Must be called AFTER AudioTrack.play() so the HAL has an active
-     * STREAM_MUSIC output to route through the incall-music usecase.
+     * Pixel calls this before AudioRecord is opened so the HAL creates the
+     * capture and Telephony Tx paths from one configuration.  Other profiles
+     * call it after AudioTrack.play(), which is the ordering their HAL needs.
      *
      * Also re-enforces stream volumes here as a secondary safeguard.
      * GsmCallManager sets volumes in configureAudioBridge(), but Android's
@@ -1764,10 +1849,10 @@ class RtpSession(
                 // route change would tear down the voice path and lose the
                 // incall-music state, then the second true here was a no-op).
                 //
-                // By this point:
-                //  1. AudioTrack.play() has started (active STREAM_MUSIC output)
-                //  2. Speaker route is settled (configureAudioBridge ran 1+ sec ago)
-                //  3. restoreAudio from previous call set false (clean slate)
+                // By this point the Pixel route has settled and the previous
+                // session has cleared the parameter.  On profiles that call
+                // this after playback, the track is already active; Pixel
+                // deliberately calls it before opening AudioRecord.
                 //
                 // The explicit false first ensures the HAL processes it as a
                 // genuine state transition, even if some stale true leaked.

@@ -511,14 +511,19 @@ object GsmCallManager {
                     }
                     enforceVolumes(am)
 
-                    // Delay mixer/volume setup until speaker route change settles.
-                    Thread({
-                        try {
-                            Thread.sleep(profile.routeChangeDelayMs)
-                            enforceVolumes(am)
-                            batchMixerSetup()
-                        } catch (_: Exception) {}
-                    }, "VolEnforce").start()
+                    // Acoustic profiles still need a post-route volume pass.
+                    // Pixel digital mode already applies its final mute and
+                    // volume state from RtpSession immediately before opening
+                    // the streams, so it must not get a second asynchronous
+                    // audio-policy change during capture startup.
+                    if (!profile.silenceLocalAudio) {
+                        Thread({
+                            try {
+                                Thread.sleep(profile.routeChangeDelayMs)
+                                enforceVolumes(am)
+                            } catch (_: Exception) {}
+                        }, "VolEnforce").start()
+                    }
 
                     // Samsung Exynos re-route dance REMOVED (v2.8.39):
                     // v2.8.38 tried earpiece→speaker re-route at t=3s to force HAL

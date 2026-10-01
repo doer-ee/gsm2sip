@@ -1222,13 +1222,30 @@ class GatewayService : Service() {
                 // Track call direction and number
                 when (state) {
                     CallOrchestrator.BridgeState.GSM_RINGING -> {
-                        currentCallIncoming = true
-                        currentCallNumber = info.removePrefix("GSM call from ")
+                        // The same state is also reported with transient
+                        // status text such as "Waiting for audio HAL".  Only
+                        // the event carrying the caller prefix owns the call
+                        // number; status updates must never replace it.
+                        if (info.startsWith("GSM call from ")) {
+                            val number = info.removePrefix("GSM call from ").trim()
+                            if (number.isNotEmpty()) {
+                                currentCallIncoming = true
+                                currentCallNumber = number
+                            }
+                        }
                         if (currentAttemptStart == 0L) currentAttemptStart = System.currentTimeMillis()
                     }
                     CallOrchestrator.BridgeState.GSM_DIALING -> {
-                        currentCallIncoming = false
-                        currentCallNumber = info.removePrefix("Dialing ")
+                        // Waiting/diagnostic messages share GSM_DIALING, but
+                        // the destination must stay the number from the
+                        // original "Dialing ..." event.
+                        if (info.startsWith("Dialing ")) {
+                            val number = info.removePrefix("Dialing ").trim()
+                            if (number.isNotEmpty()) {
+                                currentCallIncoming = false
+                                currentCallNumber = number
+                            }
+                        }
                         if (currentAttemptStart == 0L) currentAttemptStart = System.currentTimeMillis()
                     }
                     else -> {}

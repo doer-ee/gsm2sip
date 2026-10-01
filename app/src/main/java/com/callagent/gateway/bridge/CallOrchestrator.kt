@@ -187,6 +187,39 @@ class CallOrchestrator(
     }
 
     /**
+     * Keep an outbound SIP caller ringing while the previous Pixel Qualcomm
+     * voice output finishes shutting down.  The inbound GSM path already did
+     * this, but SIP -> GSM calls used to dial immediately and could inherit a
+     * stale TELEPHONY_TX stream, producing a connected call with no audio.
+     */
+    private fun waitForOutboundAudioReady(
+        sipCall: SipCall,
+        gsmDestination: String,
+        waitingSince: Long = System.currentTimeMillis()
+    ) {
+        if (activeSipCall !== sipCall || bridgeState != BridgeState.GSM_DIALING) {
+            return
+        }
+
+        if (audioReady) {
+            Log.i(TAG, "Audio HAL ready — starting outbound GSM call to $gsmDestination")
+            dialOutboundGsm(sipCall, gsmDestination)
+            return
+        }
+
+        val waitedMs = System.currentTimeMillis() - waitingSince
+        if (waitedMs >= AUDIO_READY_WAIT_TIMEOUT_MS) {
+            Log.w(TAG, "Audio HAL did not become ready after ${waitedMs}ms — rejecting outbound call")
+            tearDown("Audio HAL not ready", 480 to "Audio Not Ready")
+            return
+        }
+
+        schedule(AUDIO_READY_POLL_MS) {
+            waitForOutboundAudioReady(sipCall, gsmDestination, waitingSince)
+        }
+    }
+
+    /**
      * Probe the actual AudioFlinger state instead of blindly sleeping for the
      * whole Pixel guard window.  The Qualcomm output is reusable when its
      * TELEPHONY_TX thread is in standby and no longer blocked in a write.
@@ -860,7 +893,7 @@ class CallOrchestrator(
     // ── Outbound flow (SIP → GSM) ──────────────────────
 
     private fun handleOutboundFlow(sipCall: SipCall, gsmDestination: String) {
-        Log.i(TAG, "Outbound flow: dialing GSM $gsmDestination")
+        Log.i(TAG, "Outbound flow: preparing GSM call to $gsmDestination")
 
         bridgeState = BridgeState.GSM_DIALING
         activeSipCall = sipCall
@@ -871,6 +904,24 @@ class CallOrchestrator(
             val ringing = com.callagent.gateway.sip.SipBuilder.ringing180(invite, sipCall.localTag)
             sipClient.sendTo(ringing, sipCall.remoteContactAddress ?: sipClient.serverAddress)
         }
+
+        if (!audioReady) {
+            listener?.onStateChanged(bridgeState, "Waiting for audio HAL")
+            Log.i(TAG, "Outbound GSM call held in SIP ringing until audio HAL is ready")
+            waitForOutboundAudioReady(sipCall, gsmDestination)
+            return
+        }
+
+        dialOutboundGsm(sipCall, gsmDestination)
+    }
+
+    /** Start the cellular leg once the Pixel audio path is safe to reuse. */
+    private fun dialOutboundGsm(sipCall: SipCall, gsmDestination: String) {
+        if (activeSipCall !== sipCall || bridgeState != BridgeState.GSM_DIALING) {
+            return
+        }
+
+        Log.i(TAG, "Outbound flow: dialing GSM $gsmDestination")
 
         // Dial via the SIM whose configured own number matches the SIP
         // Outbound CID.  On a dual-SIM device omitting the account leaves

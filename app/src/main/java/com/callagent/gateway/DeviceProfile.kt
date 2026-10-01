@@ -755,12 +755,10 @@ data class DeviceProfile(
         fun sm6150() = DeviceProfile(
             name = "SM6150/SM7150 (WCD9375)",
             mixerSetupCmd = buildString {
-                // The downlink has to stay audible on the speaker: capture on
-                // this device is acoustic (the HAL gives no in-call recording
-                // and no telephony-RX capture), so the microphone hearing the
-                // speaker is the only way the agent hears the caller at all.
-                // Muting it is why the agent ended up hearing just the room.
-                append("tinymix 'Voice Rx Device Mute' 0 4294967295 20 2>/dev/null; ")
+                // Digital bridge: keep the cellular downlink off the local
+                // speaker.  The caller must be captured from the in-call
+                // recording path, not acoustically through the microphone.
+                append("tinymix 'Voice Rx Device Mute' 1 4294967295 20 2>/dev/null; ")
                 // Keep the uplink stream itself open — incall_music injects
                 // into it — but mute the *device* (microphone) leg of it.
                 // Without this the physical mic is mixed into the modem
@@ -791,20 +789,9 @@ data class DeviceProfile(
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia5' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null; ")
-                // In-call record direction.  The driver accepts 0-2 only
-                // (3/"both" is rejected as invalid argument), and it sits at 1
-                // — uplink — by default.  Uplink is our own side of the call,
-                // i.e. the audio incall_music injects, so capturing it fed the
-                // agent its own echo and read rawCapRMS≈5.  Downlink is the
-                // caller's voice, which is what the agent needs to hear.
+                // In-call record: downlink only.  The Qualcomm control accepts
+                // 0..2; 2 selects the modem downlink leg.
                 append("tinymix 'Voc Rec Config' 2 2>/dev/null; ")
-                // In-call capture: DOWNLINK ONLY.
-                // The uplink leg must stay off.  It carries what we inject via
-                // incall_music, so routing it into the capture front-end feeds
-                // the agent its own voice — an echo entirely inside this phone,
-                // which is why it persisted even with the far end's microphone
-                // muted.  VOC_REC_UL was enabled here while the uplink was
-                // still silent and the mistake was invisible.
                 append("tinymix 'MultiMedia1 Mixer VOC_REC_DL' 1 2>/dev/null; ")
                 append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
                 append("tinymix 'MultiMedia4 Mixer VOC_REC_DL' 1 2>/dev/null; ")
@@ -838,65 +825,40 @@ data class DeviceProfile(
                 append("tinymix 'MultiMedia9 Mixer VOC_REC_DL' 0 2>/dev/null; ")
                 append("tinymix 'MultiMedia9 Mixer VOC_REC_UL' 0 2>/dev/null")
             },
+            // AudioTrack creation can reset the injection switches.  Re-apply
+            // only the four Incall_Music links after playback starts; this
+            // does not touch the live capture route or the voice mutes.
             mixerIncallMusicCmd = buildString {
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia5' 1 2>/dev/null; ")
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null; ")
-                append("tinymix 'Voice Tx Mute' 0 4294967295 20 2>/dev/null; ")
-                // Re-assert the mic mute here as well as in mixerSetupCmd.  The
-                // write is accepted either way (rc=0), but the HAL rewrites the
-                // voice mutes while it brings the call up, so the one issued
-                // during mixer setup is overwritten before the call is
-                // established and the caller keeps hearing the room.  This
-                // command runs once playback is going, i.e. after the HAL has
-                // settled.
-                append("tinymix 'Voice Tx Device Mute' 1 4294967295 20 2>/dev/null")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null")
             },
             // VoiceMMode1 and VoiceMMode2 — VoiceMMode2 is the session
             // actually running here (pcm19c / TERT_MI2S_RX_Voice Mixer).
             halCallActiveVsids = listOf("11c05000", "11dc5000"),
-            // ~6s: long enough to survive the silence before the agent speaks,
-            // since the digital source is the only one that counts here.
+            // ~6s: long enough to survive the silence before the caller speaks.
+            // Keep the primary in-call source alive through the normal quiet
+            // period after answer.  Pixel voice capture is a single digital
+            // path; opening another source during the call reprograms the
+            // Qualcomm route and turns a quiet call into a broken one.
             captureSilenceFrames = 300,
+            // The phone itself is silent in a digital bridge.
             silenceLocalAudio = true,
-            // Re-assert in-call capture routing once the stream is open.
-            // MultiMedia9 is the front-end VOICE_CALL lands on here, so it is
-            // the one that actually has to carry VOC_REC.
+            // AudioRecord creation can reset the selected capture front-end.
+            // Re-apply only VOC_REC after the recorder starts; changing the
+            // voice mutes or DEC/ADC routing here would reprogram the live
+            // voice path and intermittently produce silence.
             mixerCaptureCmd = buildString {
-                // DIAGNOSTIC: silence everything local, so the only audio that
-                // can reach the far end is the digital in-call path.  These
-                // mutes are issued here rather than in mixerSetupCmd because
-                // the voice mutes are gated on the HAL's is_call_active flag,
-                // which RtpSession only sets on the way into initAudio — a
-                // mute written before that is discarded, which is why every
-                // earlier attempt at muting the mic did nothing.
-                //   Voice Rx Device Mute -> downlink no longer reaches the
-                //     speaker, so nothing is audible on the phone.
-                //   Voice Tx Device Mute -> microphone leaves the GSM uplink,
-                //     so the caller stops hearing the room and their own echo.
-                //   DEC MUX / ADC volumes -> the microphone is dead at the
-                //     codec, so AudioRecord cannot pick the room up either.
-                // If the agent can still hear the caller with all of this on,
-                // in-call digital capture is genuinely working.
-                append("tinymix 'Voice Rx Device Mute' 1 4294967295 20 2>/dev/null; ")
-                append("tinymix 'Voice Tx Device Mute' 1 4294967295 20 2>/dev/null; ")
-                append("tinymix 'DEC1 MUX' 'ZERO' 2>/dev/null; ")
-                append("tinymix 'DEC2 MUX' 'ZERO' 2>/dev/null; ")
-                append("tinymix 'DEC3 MUX' 'ZERO' 2>/dev/null; ")
-                append("tinymix 'ADC1 Volume' 0 2>/dev/null; ")
-                append("tinymix 'ADC2 Volume' 0 2>/dev/null; ")
-                append("tinymix 'ADC3 Volume' 0 2>/dev/null; ")
-                // No VOC_REC / Voc Rec Config writes here any more.  Those
-                // were added while the HAL considered the call inactive and was
-                // doing nothing; now that is_call_active is set the HAL selects
-                // SND_DEVICE_IN_INCALL_REC_* and programs these itself, and
-                // overwriting them underneath it is more likely to break the
-                // record session than to help.  Report what the HAL chose.
-                // Kill the uplink leg again once the stream exists — opening
-                // the capture front-end reprograms its mixers.
-                append("tinymix 'MultiMedia9 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'Voc Rec Config' 2 2>/dev/null; ")
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_DL' 1 2>/dev/null; ")
                 append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia4 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia4 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia8 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia8 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_UL' 0 2>/dev/null; ")
                 append("echo -n 'MM9_DL='; tinymix 'MultiMedia9 Mixer VOC_REC_DL' 2>&1; ")
                 append("echo -n 'MM9_UL='; tinymix 'MultiMedia9 Mixer VOC_REC_UL' 2>&1; ")
                 append("echo -n 'VocRecCfg='; tinymix 'Voc Rec Config' 2>&1")
@@ -931,24 +893,15 @@ data class DeviceProfile(
             // of ours plays locally any more — the agent's audio goes straight
             // to Telephony Tx — so there is no feedback cost to turning this up.
             voiceCallVolPercent = 100,
-            // It reads silent only while the HAL believes the call is
-            // inactive.  With call_state announced first the in-call record
-            // session runs, and downlink-only is what we want: VOICE_CALL also
-            // captures the uplink, which carries the agent's injected audio.
+            // Capture the modem downlink digitally.  Do not put the raw mic
+            // first: that would silently re-enable the acoustic workaround.
             voiceDownlinkWorks = true,
-            // The echo this gate existed for was VOC_REC_UL folding our own
-            // uplink into the capture, and that is fixed at the routing level
-            // now.  Left on, it only destroys real audio: measured echo=601 and
-            // noise=585 gated against fwd=166 forwarded, i.e. it was dropping
-            // most of the caller, and its echoGainRatio estimate sits at 0.00
-            // because it can only learn from frames it has already classified
-            // as echo — a deadlock it cannot leave on its own.
+            // Agent playback is routed to Telephony Tx, not the speaker.
             playbackLeaksIntoCapture = false,
-            preferUnprocessedMic = true,
-            // Measured: TYPE_TELEPHONY is offered as an input and
-            // setPreferredDevice is accepted (routedFrom=18), but every source
-            // then reads rawCapRMS=0 — this HAL provides no downlink capture,
-            // and forcing the route takes the working mic fallback with it.
+            preferUnprocessedMic = false,
+            // VOICE_DOWNLINK is the digital source; do not override it with a
+            // preferred physical/telephony input device until it is proven
+            // necessary, since this HAL has returned zeros on that route.
             captureFromTelephonyRx = false,
             playbackToTelephonyTx = true,
             // The HAL binds the usecase at track creation, so the parameter
