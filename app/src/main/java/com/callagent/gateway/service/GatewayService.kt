@@ -70,6 +70,7 @@ class GatewayService : Service() {
     private var currentCallStart = 0L
     private var currentCallIncoming = true
     private var currentCallNumber = ""
+    private var currentCallSimSlot = -1
 
     /** When the call first appeared, bridged or not.
      *
@@ -694,6 +695,7 @@ class GatewayService : Service() {
             this,
             CallLogEntry(
                 direction = "OUT",
+                simSlot = simSlotForSubscription(subId),
                 number = target,
                 timestamp = System.currentTimeMillis(),
                 durationSec = 0,
@@ -765,6 +767,19 @@ class GatewayService : Service() {
             }
         }
         return android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    }
+
+    /** Physical/eSIM slot for a resolved subscription, for the traffic log. */
+    private fun simSlotForSubscription(subId: Int): Int {
+        if (subId < 0) return -1
+        return try {
+            val sm = getSystemService(android.telephony.SubscriptionManager::class.java)
+            @Suppress("MissingPermission")
+            sm?.getActiveSubscriptionInfo(subId)?.simSlotIndex ?: -1
+        } catch (e: Exception) {
+            Log.w(TAG, "SIM slot lookup for SMS log failed: ${e.message}")
+            -1
+        }
     }
 
     private fun hasSendSms(): Boolean =
@@ -1063,6 +1078,7 @@ class GatewayService : Service() {
         outgoingDurationSec = totals.outDurationSec
         currentCallStart = 0L
         currentAttemptStart = 0L
+        currentCallSimSlot = -1
 
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "callagent.pro") ?: ""
@@ -1246,11 +1262,14 @@ class GatewayService : Service() {
                         // status text such as "Waiting for audio HAL".  Only
                         // the event carrying the caller prefix owns the call
                         // number; status updates must never replace it.
-                        if (info.startsWith("GSM call from ")) {
-                            val number = info.removePrefix("GSM call from ").trim()
+                        val simCall = Regex("^(SIM\\d+|SIM\\?) call from (.+)$").matchEntire(info)
+                        if (simCall != null) {
+                            val simLabel = simCall.groupValues[1]
+                            val number = simCall.groupValues[2].trim()
                             if (number.isNotEmpty()) {
                                 currentCallIncoming = true
                                 currentCallNumber = number
+                                currentCallSimSlot = simLabel.removePrefix("SIM").toIntOrNull() ?: -1
                             }
                         }
                         if (currentAttemptStart == 0L) currentAttemptStart = System.currentTimeMillis()
@@ -1260,10 +1279,14 @@ class GatewayService : Service() {
                         // the destination must stay the number from the
                         // original "Dialing ..." event.
                         if (info.startsWith("Dialing ")) {
-                            val number = info.removePrefix("Dialing ").trim()
+                            val dial = Regex("^Dialing (.+?)(?: via (SIM\\d+|SIM\\?))?$").matchEntire(info)
+                            val number = dial?.groupValues?.getOrNull(1)?.trim()
+                                ?: info.removePrefix("Dialing ").trim()
                             if (number.isNotEmpty()) {
                                 currentCallIncoming = false
                                 currentCallNumber = number
+                                currentCallSimSlot = dial?.groupValues?.getOrNull(2)
+                                    ?.removePrefix("SIM")?.toIntOrNull() ?: -1
                             }
                         }
                         if (currentAttemptStart == 0L) currentAttemptStart = System.currentTimeMillis()
@@ -1292,6 +1315,7 @@ class GatewayService : Service() {
                     }
                     CallLogStore.addEntry(this@GatewayService, CallLogEntry(
                         direction = if (currentCallIncoming) "IN" else "OUT",
+                        simSlot = currentCallSimSlot,
                         // Timestamp the call from when it arrived or was dialled,
                         // not from when the bridge came up — an attempt that never
                         // bridged has no other time to show.
@@ -1303,6 +1327,7 @@ class GatewayService : Service() {
                     currentCallStart = 0L
                     currentAttemptStart = 0L
                     currentCallNumber = ""
+                    currentCallSimSlot = -1
                 }
 
                 // Map bridge state to notification status text

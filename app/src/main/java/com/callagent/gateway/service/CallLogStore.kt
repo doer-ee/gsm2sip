@@ -6,6 +6,8 @@ import org.json.JSONObject
 
 data class CallLogEntry(
     val direction: String,  // "IN" or "OUT"
+    /** Physical/eSIM slot used by the call, or -1 when it was unavailable. */
+    val simSlot: Int = -1,
     val number: String,
     val timestamp: Long,    // millis since epoch (call start)
     val durationSec: Long,
@@ -70,6 +72,7 @@ object CallLogStore {
         val arr = JSONArray(prefs.getString(KEY, "[]"))
         val obj = JSONObject().apply {
             put("dir", entry.direction)
+            if (entry.simSlot >= 0) put("sim", entry.simSlot)
             put("num", entry.number)
             put("ts", entry.timestamp)
             put("dur", entry.durationSec)
@@ -97,6 +100,7 @@ object CallLogStore {
             val obj = arr.getJSONObject(i)
             CallLogEntry(
                 direction = obj.getString("dir"),
+                simSlot = obj.optInt("sim", -1),
                 number = obj.getString("num"),
                 timestamp = obj.getLong("ts"),
                 durationSec = obj.getLong("dur"),
@@ -138,6 +142,7 @@ object CallLogStore {
             val updated = transform(
                 CallLogEntry(
                     direction = obj.getString("dir"),
+                    simSlot = obj.optInt("sim", -1),
                     number = obj.getString("num"),
                     timestamp = obj.getLong("ts"),
                     durationSec = obj.getLong("dur"),

@@ -846,9 +846,11 @@ class MainActivity : AppCompatActivity() {
             tvHomeCallTo.text = if (dest.isNotEmpty()) "Connected to $dest" else "Connected"
             // Inbound is the normal direction for a gateway; a dialler-initiated
             // call is the other way round.
-            tvHomeCallDirection.text =
-                if (com.callagent.gateway.gsm.GsmCallManager.activeCallState ==
-                    android.telecom.Call.STATE_ACTIVE && gsmCallActive) "GSM → SIP" else "GSM → SIP"
+            val sim = com.callagent.gateway.gsm.GsmCallManager.simLabel(
+                this, com.callagent.gateway.gsm.GsmCallManager.activeCall
+            )
+            val inbound = !info.contains("(outbound)", ignoreCase = true)
+            tvHomeCallDirection.text = if (inbound) "$sim → SIP" else "SIP → $sim"
             startCallTimer()
         } else {
             homeCallCard.visibility = View.GONE
@@ -1390,13 +1392,16 @@ class MainActivity : AppCompatActivity() {
             // itself, and the slot where a call shows its duration.
             row.findViewById<TextView>(R.id.tvRowSub).text = when {
                 sms -> e.text.replace('\n', ' ').trim().ifEmpty { "(no text)" }
-                e.durationSec > 0 -> if (incoming) "GSM → SIP" else "SIP → GSM"
+                e.durationSec > 0 -> {
+                    val sim = if (e.simSlot >= 0) "SIM${e.simSlot}" else "SIM?"
+                    if (incoming) "$sim → SIP" else "SIP → $sim"
+                }
                 else -> "Not connected"
             }
             val dur = row.findViewById<TextView>(R.id.tvRowDuration)
             when {
                 sms -> {
-                    dur.text = "SMS"
+                    dur.text = if (e.simSlot >= 0) "SMS:SIM${e.simSlot}" else "SMS:SIM?"
                     dur.setTextColor(Color.parseColor("#60A5FA"))
                 }
                 e.durationSec > 0 -> {

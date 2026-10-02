@@ -95,7 +95,7 @@ object GsmCallManager {
 
         when (call.state) {
             Call.STATE_RINGING -> {
-                Log.i(TAG, "Incoming GSM call from $number")
+                Log.i(TAG, "Incoming ${simLabel(service, call)} call from $number")
                 // Silence the ringtone immediately — this is a gateway device,
                 // not a user-facing phone.  The call will be auto-answered
                 // once the SIP leg is established.
@@ -108,10 +108,10 @@ object GsmCallManager {
                 listener?.onIncomingGsmCall(call, number)
             }
             Call.STATE_DIALING, Call.STATE_CONNECTING -> {
-                Log.i(TAG, "Outgoing GSM call to $number")
+                Log.i(TAG, "Outgoing ${simLabel(service, call)} call to $number")
             }
             Call.STATE_ACTIVE -> {
-                Log.i(TAG, "GSM call active: $number")
+                Log.i(TAG, "${simLabel(service, call)} call active: $number")
                 configureAudioBridge()
                 listener?.onGsmCallActive(call)
             }
@@ -151,7 +151,7 @@ object GsmCallManager {
     }
 
     fun onCallRemoved(call: Call) {
-        Log.i(TAG, "GSM call removed")
+        Log.i(TAG, "${simLabel(inCallService, call)} call removed")
         if (activeCall == call) {
             activeCall = null
             activeCallState = Call.STATE_DISCONNECTED
@@ -169,11 +169,11 @@ object GsmCallManager {
                 // transition to RINGING via the callback.  Without this,
                 // the orchestrator never learns about the incoming call.
                 val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
-                Log.i(TAG, "GSM call ringing: $number (via state change)")
+                Log.i(TAG, "${simLabel(inCallService, call)} call ringing: $number (via state change)")
                 listener?.onIncomingGsmCall(call, number)
             }
             Call.STATE_ACTIVE -> {
-                Log.i(TAG, "GSM call active")
+                Log.i(TAG, "${simLabel(inCallService, call)} call active")
                 configureAudioBridge()
                 listener?.onGsmCallActive(call)
             }
@@ -184,7 +184,7 @@ object GsmCallManager {
                     Log.w(TAG, "Disconnect cause unavailable: ${e.message}")
                     null
                 }
-                Log.i(TAG, "GSM call disconnected (cause=${lastDisconnectCause?.code})")
+                Log.i(TAG, "${simLabel(inCallService, call)} call disconnected (cause=${lastDisconnectCause?.code})")
                 notifyCallEnded(call)
                 if (activeCall == call) {
                     activeCall = null
@@ -199,7 +199,7 @@ object GsmCallManager {
     /** Answer a ringing GSM call */
     fun answerCall(call: Call? = activeCall) {
         call?.let {
-            Log.i(TAG, "Answering GSM call")
+            Log.i(TAG, "Answering ${simLabel(inCallService, it)} call")
             it.answer(it.details.videoState)
         }
     }
@@ -207,7 +207,7 @@ object GsmCallManager {
     /** Reject a ringing GSM call */
     fun rejectCall(call: Call? = activeCall) {
         call?.let {
-            Log.i(TAG, "Rejecting GSM call")
+            Log.i(TAG, "Rejecting ${simLabel(inCallService, it)} call")
             it.reject(false, "")
         }
     }
@@ -215,7 +215,7 @@ object GsmCallManager {
     /** Hang up active GSM call */
     fun hangupCall(call: Call? = activeCall) {
         call?.let {
-            Log.i(TAG, "Hanging up GSM call")
+            Log.i(TAG, "Hanging up ${simLabel(inCallService, it)} call")
             it.disconnect()
         }
     }
@@ -298,10 +298,10 @@ object GsmCallManager {
 
     @SuppressLint("MissingPermission")
     fun makeCall(context: Context, destination: String, outboundCid: String? = null): Boolean {
-        Log.i(TAG, "Making GSM call to $destination (outbound CID=${outboundCid ?: "none"})")
         val uri = Uri.fromParts("tel", destination, null)
         val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
         val account = outboundCid?.let { findPhoneAccountForCid(context, telecom, it) }
+        Log.i(TAG, "Making ${simLabel(context, account)} call to $destination (outbound CID=${outboundCid ?: "none"})")
         if (outboundCid != null && account == null) {
             Log.e(TAG, "Outbound CID $outboundCid has no unique SIM match; refusing to dial")
             return false
@@ -329,6 +329,14 @@ object GsmCallManager {
             Log.e(TAG, "ACTION_CALL fallback failed: ${e.message}")
             return false
         }
+    }
+
+    /** Resolve the SIM label selected by an outbound caller ID. */
+    @SuppressLint("MissingPermission")
+    fun simLabelForCid(context: Context, outboundCid: String?): String {
+        if (outboundCid.isNullOrBlank()) return "SIM?"
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        return simLabel(context, findPhoneAccountForCid(context, telecom, outboundCid))
     }
 
     /**
@@ -404,6 +412,34 @@ object GsmCallManager {
         }
         return matches.single()
     }
+
+    /** Human-readable SIM label for logs and the in-app call history. */
+    fun simLabel(context: Context?, call: Call? = activeCall): String =
+        simLabel(context, call?.details?.accountHandle)
+
+    /** Human-readable SIM label for a selected Telecom phone account. */
+    fun simLabel(context: Context?, account: PhoneAccountHandle?): String {
+        val slot = simSlot(context, account)
+        return if (slot >= 0) "SIM$slot" else "SIM?"
+    }
+
+    /** Resolve a Telecom phone account to the physical/eSIM slot index. */
+    fun simSlot(context: Context?, account: PhoneAccountHandle?): Int {
+        if (context == null || account == null) return -1
+        return try {
+            val tm = context.getSystemService(TelephonyManager::class.java)
+            val sm = context.getSystemService(SubscriptionManager::class.java)
+            val subId = tm.getSubscriptionId(account)
+            if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) -1
+            else sm.getActiveSubscriptionInfo(subId)?.simSlotIndex ?: -1
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not resolve SIM slot for log label: ${e.message}")
+            -1
+        }
+    }
+
+    fun simSlot(context: Context?, call: Call?): Int =
+        simSlot(context, call?.details?.accountHandle)
 
     private fun samePhoneNumber(first: String, second: String): Boolean {
         val a = first.filter(Char::isDigit)

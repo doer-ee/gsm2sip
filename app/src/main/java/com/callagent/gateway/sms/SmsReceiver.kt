@@ -67,6 +67,7 @@ class SmsReceiver : BroadcastReceiver() {
             context,
             CallLogEntry(
                 direction = "IN",
+                simSlot = slot,
                 number = sender,
                 timestamp = sms.receivedAt,
                 durationSec = 0,

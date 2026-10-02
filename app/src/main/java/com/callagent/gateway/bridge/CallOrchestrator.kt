@@ -168,7 +168,7 @@ class CallOrchestrator(
 
         if (audioReady) {
             pendingIncoming = null
-            Log.i(TAG, "Audio HAL ready — starting SIP flow for waiting GSM call from $number")
+            Log.i(TAG, "Audio HAL ready — starting SIP flow for waiting ${GsmCallManager.simLabel(context, call)} call from $number")
             Thread({ handleInboundFlow(call) }, "SIP-OutCall").start()
             return
         }
@@ -202,7 +202,7 @@ class CallOrchestrator(
         }
 
         if (audioReady) {
-            Log.i(TAG, "Audio HAL ready — starting outbound GSM call to $gsmDestination")
+            Log.i(TAG, "Audio HAL ready — starting outbound ${GsmCallManager.simLabel(context, activeGsmCall)} call to $gsmDestination")
             dialOutboundGsm(sipCall, gsmDestination)
             return
         }
@@ -610,7 +610,8 @@ class CallOrchestrator(
     /** Incoming GSM call — this is the INBOUND flow trigger */
     @Synchronized
     override fun onIncomingGsmCall(call: Call, number: String) {
-        Log.i(TAG, "Incoming GSM call from $number")
+        val sim = GsmCallManager.simLabel(context, call)
+        Log.i(TAG, "Incoming $sim call from $number")
 
         // onCallAdded() and the first STATE_RINGING callback can describe the
         // same Telecom call. Do not reject the call as a duplicate.
@@ -631,12 +632,12 @@ class CallOrchestrator(
         activeGsmCall = call
         lastStateChangeTime = System.currentTimeMillis()
         ensureGsmStateWatchdog()
-        listener?.onStateChanged(bridgeState, "GSM call from $number")
+        listener?.onStateChanged(bridgeState, "$sim call from $number")
 
         if (!audioReady) {
             pendingIncoming = PendingIncoming(call, number)
             listener?.onStateChanged(bridgeState, "Waiting for audio HAL")
-            Log.i(TAG, "GSM ringing from $number — audio HAL is not ready, holding SIP flow")
+            Log.i(TAG, "$sim ringing from $number — audio HAL is not ready, holding SIP flow")
             waitForAudioReady(call, number)
             return
         }
@@ -645,13 +646,13 @@ class CallOrchestrator(
         // When the agent answers on SIP, we'll answer GSM so the caller
         // hears the agent immediately with no dead air.
         // The caller hears normal ringing in the meantime.
-        Log.i(TAG, "GSM ringing from $number — placing SIP call first")
+        Log.i(TAG, "$sim ringing from $number — placing SIP call first")
         Thread({ handleInboundFlow(call) }, "SIP-OutCall").start()
     }
 
     /** GSM call is now active (answered) */
     override fun onGsmCallActive(call: Call) {
-        Log.i(TAG, "GSM call active")
+        Log.i(TAG, "${GsmCallManager.simLabel(context, call)} call active")
         activeGsmCall = call
         ensureGsmStateWatchdog()
 
@@ -693,7 +694,7 @@ class CallOrchestrator(
                     // DIALLER flow: GSM active → place SIP call to Asterisk (like inbound)
                     diallerInitiated = false
                     bridgeState = BridgeState.GSM_ANSWERED
-                    listener?.onStateChanged(bridgeState, "GSM answered, calling Asterisk")
+                    listener?.onStateChanged(bridgeState, "${GsmCallManager.simLabel(context, call)} answered, calling Asterisk")
                     Thread({ handleInboundFlow(call) }, "SIP-OutCall").start()
                 } else {
                     // SIP-initiated OUTBOUND flow: GSM destination answered → start audio bridge
@@ -730,7 +731,7 @@ class CallOrchestrator(
             Call.STATE_DISCONNECTED -> "DISCONNECTED"
             else -> "OTHER($state)"
         }
-        Log.d(TAG, "GSM state: $stateStr")
+        Log.d(TAG, "${GsmCallManager.simLabel(context, call)} state: $stateStr")
 
         // Track the GSM call object as soon as we see it, so teardown works
         // even if the call never reaches ACTIVE (e.g. wrong number, rejected)
@@ -740,12 +741,12 @@ class CallOrchestrator(
         }
 
         if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE) {
-            tearDown("GSM call disconnected",
+            tearDown("${GsmCallManager.simLabel(context, call)} call disconnected",
                 sipStatusFor(GsmCallManager.lastDisconnectCause))
         } else if (state == Call.STATE_DISCONNECTING && bridgeState != BridgeState.IDLE) {
             // Telecom can remain in DISCONNECTING for a while after the radio
             // has already released the call.  End the SIP leg immediately.
-            tearDown("GSM call disconnecting")
+            tearDown("${GsmCallManager.simLabel(context, call)} call disconnecting")
         }
     }
 
@@ -774,12 +775,12 @@ class CallOrchestrator(
         }
 
     override fun onGsmCallEnded(call: Call) {
-        Log.i(TAG, "GSM call ended")
+        Log.i(TAG, "${GsmCallManager.simLabel(context, call)} call ended")
         // Tear down if this is our tracked call, OR if we're in a call state
         // but activeGsmCall was never set (call failed before going ACTIVE)
         if (call == activeGsmCall ||
             (activeGsmCall == null && bridgeState != BridgeState.IDLE)) {
-            tearDown("GSM call ended",
+            tearDown("${GsmCallManager.simLabel(context, call)} call ended",
                 sipStatusFor(GsmCallManager.lastDisconnectCause))
         }
     }
@@ -864,7 +865,7 @@ class CallOrchestrator(
 
     private fun handleInboundFlow(gsmCall: Call) {
         val callerNumber = gsmCall.details?.handle?.schemeSpecificPart ?: "unknown"
-        Log.i(TAG, "Inbound flow: placing SIP call for GSM caller $callerNumber")
+        Log.i(TAG, "Inbound flow: placing SIP call for ${GsmCallManager.simLabel(context, activeGsmCall)} caller $callerNumber")
 
         bridgeState = BridgeState.SIP_CALLING
         listener?.onStateChanged(bridgeState, "Calling Asterisk for $callerNumber")
@@ -893,11 +894,12 @@ class CallOrchestrator(
     // ── Outbound flow (SIP → GSM) ──────────────────────
 
     private fun handleOutboundFlow(sipCall: SipCall, gsmDestination: String) {
-        Log.i(TAG, "Outbound flow: preparing GSM call to $gsmDestination")
+        val sim = GsmCallManager.simLabelForCid(context, sipCall.callerNumber)
+        Log.i(TAG, "Outbound flow: preparing $sim call to $gsmDestination")
 
         bridgeState = BridgeState.GSM_DIALING
         activeSipCall = sipCall
-        listener?.onStateChanged(bridgeState, "Dialing $gsmDestination")
+        listener?.onStateChanged(bridgeState, "Dialing $gsmDestination via $sim")
 
         // Send 180 Ringing to SIP caller while GSM dials
         sipCall.originalInvite?.let { invite ->
@@ -907,7 +909,7 @@ class CallOrchestrator(
 
         if (!audioReady) {
             listener?.onStateChanged(bridgeState, "Waiting for audio HAL")
-            Log.i(TAG, "Outbound GSM call held in SIP ringing until audio HAL is ready")
+            Log.i(TAG, "Outbound $sim call held in SIP ringing until audio HAL is ready")
             waitForOutboundAudioReady(sipCall, gsmDestination)
             return
         }
@@ -921,7 +923,8 @@ class CallOrchestrator(
             return
         }
 
-        Log.i(TAG, "Outbound flow: dialing GSM $gsmDestination")
+        val sim = GsmCallManager.simLabelForCid(context, sipCall.callerNumber)
+        Log.i(TAG, "Outbound flow: dialing $sim $gsmDestination")
 
         // Dial via the SIM whose configured own number matches the SIP
         // Outbound CID.  On a dual-SIM device omitting the account leaves
