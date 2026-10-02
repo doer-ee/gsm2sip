@@ -58,6 +58,8 @@ class GatewayService : Service() {
     private var cfgUser = ""
     private var cfgPass = ""
     private var currentLocalIp = ""
+    /** Network handle used when the current SipClient socket was created. */
+    private var currentNetworkHandle: Long? = null
 
     // ── Call tracking ───────────────────────────────────
     private var onlineSince = 0L
@@ -169,12 +171,13 @@ class GatewayService : Service() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.i(TAG, "Network available")
+                Log.i(TAG, "Network available (handle=${network.networkHandle})")
                 logTransportIfChanged()
                 checkNetworkChanged()
             }
             override fun onLost(network: Network) {
-                Log.i(TAG, "Network lost")
+                val wasCurrent = network.networkHandle == currentNetworkHandle
+                Log.i(TAG, "Network lost (handle=${network.networkHandle}, current=$wasCurrent)")
                 // During an active GSM call, cellular data goes SUSPENDED which
                 // fires onLost.  This is normal Android behavior — do NOT tear
                 // down the bridge.  WiFi still carries SIP/RTP traffic.
@@ -187,14 +190,20 @@ class GatewayService : Service() {
                     return
                 }
                 logTransportIfChanged()
-                // Don't reconnect on the strength of onLost alone.  This
-                // fires whenever any network goes away — cellular settling
-                // after boot, mobile data dropping while WiFi carries the
-                // registration perfectly well — and each one rebuilt the
-                // socket and sent a fresh REGISTER for nothing.
-                // checkNetworkChanged() reconnects only if the local IP
-                // actually moved or the registration is genuinely gone.
-                checkNetworkChanged()
+                // A socket bound to a Network remains bound to that exact
+                // Network object.  The local IP can remain unchanged across
+                // a capability transition, so IP-only detection leaves a
+                // dead socket sending ENETUNREACH forever.  Recheck after
+                // Android publishes the replacement active network and
+                // compare its handle as well as its address.
+                if (wasCurrent) {
+                    thread(name = "gateway-network-recheck") {
+                        Thread.sleep(NETWORK_RECHECK_DELAY_MS)
+                        checkNetworkChanged()
+                    }
+                } else {
+                    checkNetworkChanged()
+                }
             }
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
                 logTransportIfChanged()
@@ -230,11 +239,21 @@ class GatewayService : Service() {
         if (busy) return
         val newIp = getLocalIp()
         if (newIp == "0.0.0.0") return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val activeNetwork = cm.activeNetwork ?: return
+        val newNetworkHandle = activeNetwork.networkHandle
         val ipChanged = newIp != currentLocalIp
+        val networkChanged = currentNetworkHandle != null &&
+            newNetworkHandle != currentNetworkHandle
         val notRegistered = sipClient?.registered != true
-        if (ipChanged || notRegistered) {
-            if (ipChanged) broadcastLog("NET: IP changed $currentLocalIp → $newIp, reconnecting")
-            else broadcastLog("NET: registration lost, reconnecting")
+        if (ipChanged || networkChanged || notRegistered) {
+            when {
+                networkChanged -> broadcastLog(
+                    "NET: network changed $currentNetworkHandle → $newNetworkHandle, reconnecting"
+                )
+                ipChanged -> broadcastLog("NET: IP changed $currentLocalIp → $newIp, reconnecting")
+                else -> broadcastLog("NET: registration lost, reconnecting")
+            }
             reconnect()
         }
     }
@@ -1145,6 +1164,7 @@ class GatewayService : Service() {
             as ConnectivityManager).activeNetwork
         val localIp = getLocalIp()
         currentLocalIp = localIp
+        currentNetworkHandle = activeNetwork?.networkHandle
         broadcastLog("Local IP: $localIp")
 
         // STUN: discover public IP for NAT traversal.  Optional, because a
@@ -1720,6 +1740,7 @@ class GatewayService : Service() {
 
     companion object {
         private const val TAG = "GatewayService"
+        private const val NETWORK_RECHECK_DELAY_MS = 1_000L
         private const val LOG_BUFFER_SIZE = 200
         /** Ring buffer of recent log messages — survives activity pause/resume. */
         private val bufferTimeFormat =

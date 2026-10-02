@@ -56,7 +56,15 @@ class BatteryChargeGuard(private val context: Context) {
             // Release a gate that *this* feature set. Do not interfere with
             // another charge manager when this feature has never controlled it.
             if (current == 0 || setDisabled(false, disablePath)) {
-                prefs.edit().putBoolean(KEY_OWNED, false).commit()
+                // An explicit disable means the remembered hysteresis state
+                // must also be cleared. A service restart, in contrast, must
+                // not clear it: if we paused at the upper limit and restart
+                // at 52%, the charger should remain paused until the lower
+                // limit is reached.
+                prefs.edit()
+                    .putBoolean(KEY_OWNED, false)
+                    .putBoolean(KEY_LAST_DISABLED, false)
+                    .commit()
             }
             return
         }
@@ -77,11 +85,24 @@ class BatteryChargeGuard(private val context: Context) {
         val shouldDisable = when {
             capacity >= stop -> true
             capacity <= start -> false
-            else -> return // Keep the previous state inside the hysteresis band.
+            else -> {
+                // Migrate the old ownership flag on the first run after this
+                // update. Older builds remembered that they had paused the
+                // charger, but did not preserve the actual paused state
+                // across a service restart.
+                if (prefs.contains(KEY_LAST_DISABLED)) {
+                    prefs.getBoolean(KEY_LAST_DISABLED, current == 1)
+                } else {
+                    prefs.getBoolean(KEY_OWNED, current == 1)
+                }
+            }
         }
         if (current == if (shouldDisable) 1 else 0) return
         if (setDisabled(shouldDisable, disablePath)) {
-            if (shouldDisable) prefs.edit().putBoolean(KEY_OWNED, true).commit()
+            prefs.edit()
+                .putBoolean(KEY_LAST_DISABLED, shouldDisable)
+                .putBoolean(KEY_OWNED, shouldDisable)
+                .commit()
             Log.i(TAG, "Charge ${if (shouldDisable) "paused" else "resumed"} at $capacity% ($start–$stop%)")
         }
     }
@@ -115,6 +136,7 @@ class BatteryChargeGuard(private val context: Context) {
         const val KEY_ENABLED = "battery_protection"
         const val KEY_START = "battery_start_threshold"
         const val KEY_STOP = "battery_stop_threshold"
+        private const val KEY_LAST_DISABLED = "battery_last_disabled"
         private const val KEY_OWNED = "battery_control_owned"
     }
 }
