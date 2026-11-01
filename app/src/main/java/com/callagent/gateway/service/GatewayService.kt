@@ -1867,7 +1867,7 @@ class GatewayService : Service() {
 
         /** How long to wait before retrying a message the server did not take. */
         private const val SMS_RETRY_MS = 30_000L
-        private const val SMS_RECONCILE_MS = 5L * 60 * 1000
+        private const val SMS_RECONCILE_MS = 60L * 1000
 
         /** X-SMS-Received: ISO 8601 UTC, so the server does not have to guess
          *  at the gateway's local time zone. */

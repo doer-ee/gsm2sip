@@ -16,7 +16,7 @@ import kotlin.math.abs
  * replayed merely because a new APK was installed.
  *
  * New rows missed by the broadcast are queued. Rows accepted by SIP are
- * audited twice using the same ID, after 10 minutes and then 24 hours. The
+ * audited twice using the same ID, after 1 minute and then 24 hours. The
  * PBX durable inbox deduplicates both audits. A 30-day horizon caps the scan.
  */
 object SmsInboxReconciler {
@@ -24,7 +24,7 @@ object SmsInboxReconciler {
     private const val PREFS = "sms_inbox_reconcile"
     private const val KEY_BASELINE_ID = "baseline_id"
     private const val KEY_AUDITS = "audits"
-    private const val FIRST_AUDIT_MS = 10L * 60 * 1000
+    private const val FIRST_AUDIT_MS = 60L * 1000
     private const val SECOND_AUDIT_MS = 24L * 60 * 60 * 1000
     private const val HORIZON_MS = 30L * 24 * 60 * 60 * 1000
 
