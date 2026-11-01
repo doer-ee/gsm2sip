@@ -23,6 +23,7 @@ import com.callagent.gateway.sms.PendingSms
 import com.callagent.gateway.sms.SmsOutbox
 import com.callagent.gateway.sms.SmsSender
 import com.callagent.gateway.sms.SmsStore
+import com.callagent.gateway.sms.SmsInboxReconciler
 import android.util.Log
 import com.callagent.gateway.BuildConfig
 import com.callagent.gateway.GatewayApp
@@ -346,6 +347,7 @@ class GatewayService : Service() {
         // refused.
         if (!hasReceiveSms()) grantViaRoot("android.permission.RECEIVE_SMS")
         if (!hasSendSms()) grantViaRoot("android.permission.SEND_SMS")
+        if (!hasReadSms()) grantViaRoot("android.permission.READ_SMS")
 
         val queued = SmsStore.pending(this).size
         if (hasReceiveSms()) {
@@ -358,6 +360,8 @@ class GatewayService : Service() {
         } else {
             broadcastLog("WARNING: SEND_SMS not granted — send requests will be refused")
         }
+        if (hasReadSms()) startSmsReconciliation()
+        else broadcastLog("WARNING: READ_SMS not granted — inbox reconciliation unavailable")
     }
 
     private fun grantViaRoot(permission: String) {
@@ -371,6 +375,10 @@ class GatewayService : Service() {
 
     private fun hasReceiveSms(): Boolean =
         checkSelfPermission(android.Manifest.permission.RECEIVE_SMS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    private fun hasReadSms(): Boolean =
+        checkSelfPermission(android.Manifest.permission.READ_SMS) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
     /** Release the init flag if it has been held implausibly long. */
@@ -509,6 +517,33 @@ class GatewayService : Service() {
      *  fire at once, and sending the same message twice is worse than late. */
     private val smsFlushing = AtomicBoolean(false)
     @Volatile private var smsRetryScheduled = false
+    private val smsReconciling = AtomicBoolean(false)
+    @Volatile private var smsReconcileThread: Thread? = null
+
+    private fun startSmsReconciliation() {
+        if (!smsReconciling.compareAndSet(false, true)) return
+        smsReconcileThread = thread(name = "sms-inbox-reconcile") {
+            try {
+                while (!stopped) {
+                    try {
+                        val queued = SmsInboxReconciler.scan(this)
+                        if (queued > 0) {
+                            broadcastLog("SMS inbox: recovered/auditing $queued message(s)")
+                            flushSmsQueue("inbox reconciliation")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "SMS inbox reconciliation failed: ${e.message}", e)
+                        broadcastLog("WARNING: SMS inbox reconciliation failed: ${e.message}")
+                    }
+                    Thread.sleep(SMS_RECONCILE_MS)
+                }
+            } catch (_: InterruptedException) {
+                // Service is stopping.
+            } finally {
+                smsReconciling.set(false)
+            }
+        }
+    }
 
     /**
      * Hand every queued SMS to the server over the registration that is
@@ -541,6 +576,7 @@ class GatewayService : Service() {
                 for (sms in queue) {
                     val code = sendSmsOverSip(sip, sms)
                     if (code == 200 || code == 202) {
+                        SmsStore.markAccepted(this, sms.id)
                         SmsStore.remove(this, sms.id)
                         broadcastLog("SMS: ${sms.id} from ${sms.from} accepted ($code)")
                     } else {
@@ -559,6 +595,11 @@ class GatewayService : Service() {
                 scheduleSmsRetry()
             } finally {
                 smsFlushing.set(false)
+                // A reconciliation scan can append after this flush took its
+                // snapshot. Its own flush then sees smsFlushing=true, so give
+                // that queued message another chance without waiting for a
+                // future registration event.
+                if (SmsStore.pending(this).isNotEmpty() && !stopped) scheduleSmsRetry()
             }
         }
     }
@@ -1407,6 +1448,7 @@ class GatewayService : Service() {
     }
 
     override fun onDestroy() {
+        smsReconcileThread?.interrupt()
         batteryChargeGuard?.stop()
         batteryChargeGuard = null
         unregisterNetworkCallback()
@@ -1825,6 +1867,7 @@ class GatewayService : Service() {
 
         /** How long to wait before retrying a message the server did not take. */
         private const val SMS_RETRY_MS = 30_000L
+        private const val SMS_RECONCILE_MS = 5L * 60 * 1000
 
         /** X-SMS-Received: ISO 8601 UTC, so the server does not have to guess
          *  at the gateway's local time zone. */

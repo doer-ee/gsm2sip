@@ -3,6 +3,7 @@ package com.callagent.gateway.sms
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.util.UUID
 
 /**
@@ -36,16 +37,29 @@ data class PendingSms(
 object SmsStore {
     private const val PREFS = "sms_queue"
     private const val KEY = "pending"
+    private const val KEY_ACCEPTED = "accepted"
 
     /** Beyond this the queue is not a queue, it is a leak. Oldest go first. */
     private const val MAX_PENDING = 200
 
     fun newId(): String = UUID.randomUUID().toString()
 
+    /** Same ID from the SMS_RECEIVED PDU and the later provider inbox row.
+     *  The PBX uses it as an idempotency key when reconciliation replays a
+     *  message after a seemingly successful SIP handoff. */
+    fun idForInbound(from: String, subId: Int, sentAt: Long, body: String): String {
+        val bytes = "$from\u0000$subId\u0000$sentAt\u0000$body".toByteArray(Charsets.UTF_8)
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        return "rx-" + digest.joinToString("") { "%02x".format(it) }
+    }
+
     @Synchronized
     fun add(context: Context, sms: PendingSms) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val arr = JSONArray(prefs.getString(KEY, "[]"))
+        for (i in 0 until arr.length()) {
+            if (arr.optJSONObject(i)?.optString("id") == sms.id) return
+        }
         arr.put(toJson(sms))
         while (arr.length() > MAX_PENDING) arr.remove(0)
         prefs.edit().putString(KEY, arr.toString()).commit()
@@ -84,6 +98,33 @@ object SmsStore {
             if (o.optString("id") == id) o.put("attempts", o.optInt("attempts") + 1)
         }
         prefs.edit().putString(KEY, arr.toString()).commit()
+    }
+
+    /** Remember SIP acceptance long enough for the two inbox audits. The
+     *  stable ID covers the gap between Asterisk's SIP response and its
+     *  asynchronous AGI execution; PBX deduplication prevents duplicates. */
+    @Synchronized
+    fun markAccepted(context: Context, id: String) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val accepted = JSONObject(prefs.getString(KEY_ACCEPTED, "{}") ?: "{}")
+        val now = System.currentTimeMillis()
+        accepted.put(id, now)
+        val cutoff = now - 30L * 24 * 60 * 60 * 1000
+        val keys = accepted.keys()
+        val stale = mutableListOf<String>()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (accepted.optLong(key) < cutoff) stale.add(key)
+        }
+        stale.forEach { accepted.remove(it) }
+        prefs.edit().putString(KEY_ACCEPTED, accepted.toString()).commit()
+    }
+
+    @Synchronized
+    fun acceptedAt(context: Context, id: String): Long {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val accepted = JSONObject(prefs.getString(KEY_ACCEPTED, "{}") ?: "{}")
+        return accepted.optLong(id, 0L)
     }
 
     private fun toJson(s: PendingSms) = JSONObject().apply {

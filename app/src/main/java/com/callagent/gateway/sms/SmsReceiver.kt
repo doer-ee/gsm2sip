@@ -36,6 +36,7 @@ class SmsReceiver : BroadcastReceiver() {
         val sender = parts[0].displayOriginatingAddress ?: parts[0].originatingAddress ?: ""
         val text = parts.joinToString("") { it.displayMessageBody ?: it.messageBody ?: "" }
         val receivedAt = parts[0].timestampMillis
+        val effectiveReceivedAt = if (receivedAt > 0) receivedAt else System.currentTimeMillis()
 
         // Which SIM took it.  Two extra names are in circulation and OEMs
         // disagree about which they set, so try both before giving up.
@@ -46,11 +47,11 @@ class SmsReceiver : BroadcastReceiver() {
         val (slot, carrier, ownNumber) = describeSim(context, subId)
 
         val sms = PendingSms(
-            id = SmsStore.newId(),
+            id = SmsStore.idForInbound(sender, subId, effectiveReceivedAt, text),
             from = sender,
             to = ownNumber,
             text = text,
-            receivedAt = if (receivedAt > 0) receivedAt else System.currentTimeMillis(),
+            receivedAt = effectiveReceivedAt,
             parts = parts.size,
             subId = subId,
             slot = slot,

@@ -45,6 +45,9 @@
          (and with it the default-SMS-app role) is only needed to *store* them,
          which a gateway has no reason to do. -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <!-- Reconcile inbox rows against SMS_RECEIVED broadcasts after restarts or
+         an accepted SIP MESSAGE whose AGI delivery did not complete. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
